@@ -13,13 +13,14 @@ import (
 // It wires together the Redis store, timing wheel, ready queue, and
 // distributed lock into a single coherent unit.
 type Queue struct {
-	cfg    *config
-	store  *store
-	wheel  *timeWheel
-	ready  *readyQueue
-	lock   *distLock
-	closed atomic.Bool
-	stopCh chan struct{}
+	cfg     *config
+	store   *store
+	wheel   *timeWheel
+	ready   *readyQueue
+	lock    *distLock
+	closed  atomic.Bool
+	started atomic.Bool
+	stopCh  chan struct{}
 }
 
 // New creates a new Queue with the given options.
@@ -85,6 +86,7 @@ func (q *Queue) Start(ctx context.Context) error {
 		return err
 	}
 
+	q.started.Store(true)
 	q.wheel.start()
 
 	// Leader-election heartbeat goroutine.
@@ -248,8 +250,11 @@ func (q *Queue) Shutdown(ctx context.Context) error {
 	// Stop all per-topic drain goroutines first (they may trigger wheel adds).
 	q.ready.stopAll()
 
-	// Stop the timing wheel and wait for in-flight ticks.
-	return q.wheel.stop(ctx)
+	// Stop the timing wheel only if Start() was called.
+	if q.started.Load() {
+		return q.wheel.stop(ctx)
+	}
+	return nil
 }
 
 // instanceIDFromParts builds a deterministic instance ID from the hostname and
