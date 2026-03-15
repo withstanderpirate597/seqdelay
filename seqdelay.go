@@ -245,15 +245,11 @@ func (q *Queue) Shutdown(ctx context.Context) error {
 	// Signal the leader-election goroutine to stop.
 	close(q.stopCh)
 
-	// Stop the timing wheel and wait for in-flight ticks.
-	if err := q.wheel.stop(ctx); err != nil {
-		return err
-	}
-
-	// Stop all per-topic drain goroutines.
+	// Stop all per-topic drain goroutines first (they may trigger wheel adds).
 	q.ready.stopAll()
 
-	return nil
+	// Stop the timing wheel and wait for in-flight ticks.
+	return q.wheel.stop(ctx)
 }
 
 // instanceIDFromParts builds a deterministic instance ID from the hostname and

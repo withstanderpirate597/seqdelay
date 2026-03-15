@@ -11,6 +11,7 @@ import (
 type callbackEntry struct {
 	fn     func(context.Context, *Task) error
 	cancel context.CancelFunc
+	done   chan struct{} // closed when drain goroutine exits
 }
 
 // readyQueue manages per-topic drain goroutines that bridge the Redis ready
@@ -34,9 +35,6 @@ func newReadyQueue(s *store, maxTopics int) *readyQueue {
 // registerCallback registers fn as the handler for the given topic and starts
 // a drain goroutine that continuously pops tasks from the Redis ready list and
 // invokes fn.
-//
-// Returns ErrTopicConflict if a callback is already registered for the topic,
-// or ErrTooManyTopics if the topic cap has been reached.
 func (rq *readyQueue) registerCallback(topic string, fn func(context.Context, *Task) error) error {
 	rq.mu.Lock()
 	defer rq.mu.Unlock()
@@ -49,26 +47,29 @@ func (rq *readyQueue) registerCallback(topic string, fn func(context.Context, *T
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
 
 	rq.callbacks[topic] = callbackEntry{
 		fn:     fn,
 		cancel: cancel,
+		done:   done,
 	}
 
-	go rq.drain(ctx, topic, fn)
+	go rq.drain(ctx, done, topic, fn)
 	return nil
 }
 
 // drainPopTimeout is the BLPOP block duration used inside drain goroutines.
-// Using a finite timeout lets the goroutine observe context cancellation
-// without blocking forever on an empty list.
-const drainPopTimeout = 2 * time.Second
+// go-redis enforces a minimum of 1s. Using a short timeout lets the goroutine
+// check context cancellation frequently.
+const drainPopTimeout = 1 * time.Second
 
 // drain is the per-topic goroutine. It repeatedly calls PopTask (BLPOP) to
 // receive tasks in StateActive, invokes fn, and on success auto-finishes the
 // task. If fn returns an error the task is left in StateActive so that the TTR
 // timer can trigger redelivery.
-func (rq *readyQueue) drain(ctx context.Context, topic string, fn func(context.Context, *Task) error) {
+func (rq *readyQueue) drain(ctx context.Context, done chan struct{}, topic string, fn func(context.Context, *Task) error) {
+	defer close(done)
 	for {
 		select {
 		case <-ctx.Done():
@@ -76,29 +77,21 @@ func (rq *readyQueue) drain(ctx context.Context, topic string, fn func(context.C
 		default:
 		}
 
-		// PopTask sets the task state to StateActive before returning.
 		task, err := rq.store.PopTask(ctx, topic, drainPopTimeout)
 		if err != nil {
-			// Context cancelled or Redis error — exit the goroutine.
 			if ctx.Err() != nil {
 				return
 			}
-			// Transient Redis error; continue and retry.
 			continue
 		}
 		if task == nil {
-			// Timeout elapsed with no item; loop back to BLPOP.
+			// BLPOP timeout, loop back and check ctx
 			continue
 		}
 
-		// Invoke the user callback.
 		if fnErr := fn(ctx, task); fnErr == nil {
-			// Success: mark the task finished. Ignore the error here as the
-			// task will naturally expire anyway; best-effort finish is fine.
 			_ = rq.store.FinishTask(ctx, task.Topic, task.ID)
 		}
-		// On callback error: do nothing. The TTR wheel entry will fire
-		// ReadyTask again for redelivery.
 	}
 }
 
@@ -110,12 +103,18 @@ func (rq *readyQueue) hasCallback(topic string) bool {
 	return ok
 }
 
-// stopAll cancels every drain goroutine.
+// stopAll cancels every drain goroutine and waits for them to exit.
 func (rq *readyQueue) stopAll() {
 	rq.mu.Lock()
-	defer rq.mu.Unlock()
-
+	entries := make([]callbackEntry, 0, len(rq.callbacks))
 	for _, entry := range rq.callbacks {
 		entry.cancel()
+		entries = append(entries, entry)
+	}
+	rq.mu.Unlock()
+
+	// Wait for all drain goroutines to exit (bounded by BLPOP timeout = 1s)
+	for _, entry := range entries {
+		<-entry.done
 	}
 }
